@@ -1,6 +1,8 @@
 import { google } from 'googleapis';
 
-const CALENDAR_ID       = process.env.GOOGLE_CALENDAR_ID;
+// CALENDAR_ID: para OAuth se puede usar 'primary' (calendar default del usuario que autorizo)
+// o un calendar especifico al que tenga acceso. Para service account es el calendar compartido.
+const CALENDAR_ID       = process.env.GOOGLE_CALENDAR_ID || 'primary';
 const MEET_DURATION_MIN = 30;
 const TIMEZONE          = 'America/Santiago';
 const WORK_START_HOUR   = 9;   // inclusive
@@ -8,13 +10,17 @@ const WORK_END_HOUR     = 18;  // exclusive (ultimo slot empieza 17:00)
 const MAX_SLOTS         = 10;  // suficiente para mostrar opciones reales del dia
 const MAX_PER_DAY       = 8;   // permite mostrar todo el dia si esta libre
 
+// USE_OAUTH: si tenemos refresh token, usamos OAuth (permite Meet auto + attendees con email invite).
+// Sin OAuth, usamos service account (limitado: no attendees, no Meet auto → cae a STATIC_MEET_LINK).
+const USE_OAUTH = !!process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
+
 function loadCreds() {
   // opcion 1 (recomendada): JSON en base64 — evita problemas de escapeo de \n en EasyPanel
   if (process.env.GOOGLE_SERVICE_ACCOUNT_B64) {
     const decoded = Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_B64, 'base64').toString('utf-8');
     return JSON.parse(decoded);
   }
-  // opcion 2: JSON crudo (puede romperse si el editor convierte \n del private_key en newlines)
+  // opcion 2: JSON crudo
   if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
     return JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
   }
@@ -26,6 +32,14 @@ function loadCreds() {
 }
 
 function getAuth() {
+  if (USE_OAUTH) {
+    const oauth2 = new google.auth.OAuth2(
+      process.env.GOOGLE_OAUTH_CLIENT_ID,
+      process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+    );
+    oauth2.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+    return oauth2;
+  }
   const creds = loadCreds();
   return new google.auth.JWT({
     email:  creds.client_email,
@@ -147,46 +161,64 @@ export async function createMeeting({ summary, description, attendeeEmail, start
   const start = new Date(startIso);
   const end   = new Date(start.getTime() + MEET_DURATION_MIN * 60_000);
 
-  // service accounts no pueden invitar attendees sin Domain-Wide Delegation,
-  // asi que el email del lead va en la descripcion y el Meet link se envia por WhatsApp
-  const fullDescription = [
-    attendeeEmail ? `Email del prospecto: ${attendeeEmail}` : '',
-    description || '',
-  ].filter(Boolean).join('\n\n');
-
   const baseBody = {
     summary,
-    description: fullDescription,
+    description: description || '',
     start: { dateTime: start.toISOString(), timeZone: TIMEZONE },
     end:   { dateTime: end.toISOString(),   timeZone: TIMEZONE },
   };
 
   let data;
-  // intento 1: con conferenceData (funciona si la cuenta soporta crear Meet)
-  try {
+
+  if (USE_OAUTH) {
+    // OAuth: full features — Meet auto + attendees con email invite
     const res = await calendar.events.insert({
       calendarId:            CALENDAR_ID,
       conferenceDataVersion: 1,
+      sendUpdates:           'all',
       requestBody: {
         ...baseBody,
+        attendees: attendeeEmail ? [{ email: attendeeEmail }] : [],
         conferenceData: {
           createRequest: {
-            requestId: `jqs-${Date.now()}`,
+            requestId:             `jqs-${Date.now()}`,
             conferenceSolutionKey: { type: 'hangoutsMeet' },
           },
         },
       },
     });
     data = res.data;
-  } catch (err) {
-    // si la cuenta no puede crear Meet (cuentas Gmail personales con service account),
-    // reintentamos sin conferenceData y usamos STATIC_MEET_LINK
-    console.warn('[calendar] conferenceData rejected, retrying without it:', err.message);
-    const res = await calendar.events.insert({
-      calendarId:  CALENDAR_ID,
-      requestBody: baseBody,
-    });
-    data = res.data;
+  } else {
+    // service account: sin attendees (DWD requerido), conferenceData con fallback sin él si falla
+    const fullDescription = [
+      attendeeEmail ? `Email del prospecto: ${attendeeEmail}` : '',
+      baseBody.description,
+    ].filter(Boolean).join('\n\n');
+    const saBody = { ...baseBody, description: fullDescription };
+
+    try {
+      const res = await calendar.events.insert({
+        calendarId:            CALENDAR_ID,
+        conferenceDataVersion: 1,
+        requestBody: {
+          ...saBody,
+          conferenceData: {
+            createRequest: {
+              requestId:             `jqs-${Date.now()}`,
+              conferenceSolutionKey: { type: 'hangoutsMeet' },
+            },
+          },
+        },
+      });
+      data = res.data;
+    } catch (err) {
+      console.warn('[calendar] conferenceData rejected, retrying without it:', err.message);
+      const res = await calendar.events.insert({
+        calendarId:  CALENDAR_ID,
+        requestBody: saBody,
+      });
+      data = res.data;
+    }
   }
 
   let meetLink = extractMeetLink(data);

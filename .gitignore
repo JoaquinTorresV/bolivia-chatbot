@@ -10,3 +10,6 @@ data/
 Thumbs.db
 .vscode/
 .idea/
+
+# scripts de prueba locales con credenciales hardcoded
+scripts/test-*.mjs
