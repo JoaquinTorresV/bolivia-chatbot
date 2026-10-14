@@ -18,6 +18,21 @@ export function sendWhatsApp(to, text) {
   });
 }
 
+// Envía una PLANTILLA aprobada de WhatsApp (necesaria para el primer mensaje saliente,
+// antes de que el usuario responda). bodyParams: valores para las variables {{1}}, {{2}}, …
+export function sendTemplate(to, name, bodyParams = [], lang = process.env.YCLOUD_TEMPLATE_LANG || 'es') {
+  const template = { name, language: { code: lang } };
+  if (bodyParams.length) {
+    template.components = [{
+      type: 'body',
+      parameters: bodyParams.map(text => ({ type: 'text', text: String(text ?? '') })),
+    }];
+  }
+  return ycloudfetch('/whatsapp/messages/sendDirectly', {
+    from: FROM, to, type: 'template', template,
+  });
+}
+
 // marca el mensaje entrante como leido y muestra typing indicator (check azul + "escribiendo...")
 // requiere el wamid del mensaje entrante, no solo el numero
 // fire-and-forget: no bloquea el flujo principal

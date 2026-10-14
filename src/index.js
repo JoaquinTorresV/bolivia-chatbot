@@ -1,29 +1,67 @@
 import express from 'express';
 import { handleMessage } from './bot.js';
-import { saveLead, setTakeover, normalizePhone } from './db.js';
+import { initDb, saveLead, setTakeover, markContactadoIfNuevo, normalizePhone, getLead, setEstado } from './db.js';
 import { setHumanTag, getContactById } from './crm.js';
+import { sendTemplate } from './ycloud.js';
+import { updateMeeting } from './calendar.js';
 
 const app = express();
 app.use(express.json());
 
-// ── filtro web ──────────────────────────────────────────────
-app.post('/register', (req, res) => {
-  const { phone, name, company, niche, problem, budget, email } = req.body;
-  if (!phone) return res.status(400).json({ error: 'phone requerido' });
+// CORS: permite que la landing (otro dominio) haga POST a /register desde el navegador.
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-  const normalized = phone.startsWith('+') ? phone : `+${phone}`;
-  saveLead({ phone: normalized, name, company, niche, problem, budget, email, source: 'web' });
+// ── formulario web (landing Aurun) ──────────────────────────
+// Acepta el formato de la landing (nombre/negocio/whatsapp/rubro/desafio)
+// y el legacy (name/company/phone/niche/problem). Guarda el lead como 'nuevo',
+// envía la plantilla del primer mensaje y lo marca 'contactado'.
+// El bot conversacional se activa recién cuando la persona RESPONDE.
+app.post('/register', async (req, res) => {
+  const b = req.body || {};
+  const rawPhone = b.whatsapp || b.phone;
+  if (!rawPhone) return res.status(400).json({ error: 'whatsapp/phone requerido' });
+
+  const phone = normalizePhone(rawPhone);
+  if (!phone) return res.status(400).json({ error: 'teléfono inválido' });
+
+  const name    = b.nombre  ?? b.name    ?? null;
+  const company = b.negocio ?? b.company ?? null;
+  const niche   = b.rubro   ?? b.niche   ?? null;
+  const problem = b.desafio ?? b.problem ?? null;
+  const email   = b.email   ?? null;
+
+  try {
+    await saveLead({ phone, name, company, niche, problem, email, source: 'web', estado: 'nuevo', fbp: b.fbp, fbc: b.fbc });
+  } catch (err) {
+    console.error('[register] saveLead error:', err.message);
+    return res.status(500).json({ error: 'no se pudo guardar el lead' });
+  }
+
+  // primer mensaje saliente = plantilla aprobada (si está configurada).
+  // markContactadoIfNuevo es atómico: solo un request "gana" y envía → evita doble plantilla por doble submit.
+  const tpl = process.env.YCLOUD_TEMPLATE_NAME;
+  if (tpl && await markContactadoIfNuevo(phone)) {
+    try {
+      const firstName = (name || '').trim().split(/\s+/)[0] || '';
+      await sendTemplate(phone, tpl, [firstName, company || 'tu negocio']);
+    } catch (err) {
+      console.error('[register] sendTemplate error:', err.message); // no rompe el registro
+    }
+  }
 
   const waNumber = process.env.YCLOUD_PHONE_NUMBER?.replace('+', '');
   const preText  = encodeURIComponent('Hola, acabo de completar el formulario.');
-  res.json({ success: true, waLink: `https://wa.me/${waNumber}?text=${preText}` });
+  res.json({ success: true, waLink: waNumber ? `https://wa.me/${waNumber}?text=${preText}` : null });
 });
 
 // ── voice agent handoff ─────────────────────────────────────
-// Recibe contexto del agente de voz (ElevenLabs) cuando termina de hablar con un visitante.
-// El voice agent es UNO solo embebido en ambas webs (Chile + Bolivia), entonces este endpoint
-// actua como router: si el phone es boliviano (+591) y BOLIVIA_VOICE_LEAD_URL esta configurado,
-// reenvia el lead al bot de Bolivia. Si no, guarda local (es Chile).
+// Recibe contexto del agente de voz (ElevenLabs) para un lead boliviano y lo procesa local.
 app.post('/voice-lead', async (req, res) => {
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
@@ -31,7 +69,6 @@ app.post('/voice-lead', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  // ElevenLabs puede mandar los params flat o anidados bajo "parameters"
   const payload = req.body?.parameters ?? req.body;
   console.log('[voice-lead] payload recibido:', JSON.stringify(payload));
 
@@ -41,36 +78,65 @@ app.post('/voice-lead', async (req, res) => {
   const normalized = normalizePhone(phone);
   if (!normalized) return res.status(400).json({ error: 'phone inválido' });
 
-  // routing por pais: si es boliviano y tenemos URL configurada, forward al bot Bolivia
-  const BOLIVIA_URL    = process.env.BOLIVIA_VOICE_LEAD_URL;
-  const BOLIVIA_SECRET = process.env.BOLIVIA_ADMIN_SECRET || process.env.ADMIN_SECRET;
+  // Este ES el bot de Bolivia: procesa el lead local (no rerutea a ningún lado).
+  try {
+    await saveLead({ phone: normalized, name: nombre || null, niche: nicho || null, problem: problema || null, source: 'voice' });
+  } catch (err) {
+    console.error('[voice-lead] saveLead error:', err.message);
+    return res.status(500).json({ error: 'no se pudo guardar' });
+  }
 
-  if (normalized.startsWith('+591') && BOLIVIA_URL) {
-    console.log(`[voice-lead] routing → Bolivia: ${normalized}`);
+  // primer mensaje saliente tras la llamada de voz = plantilla para agendar la reunión.
+  // Usa YCLOUD_TEMPLATE_VOICE si existe (plantilla específica de voz), si no cae a la de la landing.
+  // markContactadoIfNuevo es atómico: solo envía si el lead está 'nuevo' → evita doble plantilla.
+  const tpl = process.env.YCLOUD_TEMPLATE_VOICE || process.env.YCLOUD_TEMPLATE_NAME;
+  let messaged = false;
+  if (tpl && await markContactadoIfNuevo(normalized)) {
     try {
-      const r = await fetch(BOLIVIA_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'Authorization': `Bearer ${BOLIVIA_SECRET}`,
-        },
-        body: JSON.stringify(payload),
-      });
-      if (!r.ok) {
-        const errText = await r.text();
-        console.error(`[voice-lead] forward Bolivia fallo ${r.status}: ${errText}`);
-        return res.status(502).json({ error: 'bolivia forward failed' });
-      }
-      return res.json({ success: true, routed: 'BO' });
+      const firstName = (nombre || '').trim().split(/\s+/)[0] || '';
+      await sendTemplate(normalized, tpl, [firstName, 'tu negocio']);
+      messaged = true;
     } catch (err) {
-      console.error(`[voice-lead] forward Bolivia error: ${err.message}`);
-      return res.status(502).json({ error: 'bolivia unreachable' });
+      console.error('[voice-lead] sendTemplate error:', err.message); // no rompe el registro
     }
   }
 
-  // pais Chile (o cualquier otro): guarda local
-  saveLead({ phone: normalized, name: nombre || null, niche: nicho || null, problem: problema || null, source: 'voice' });
-  res.json({ success: true, routed: 'CL' });
+  res.json({ success: true, routed: 'BO', messaged });
+});
+
+// ── reagendar (lo usa el dashboard) ─────────────────────────
+// Mueve el evento en Google Calendar (mantiene el Meet) y actualiza la BD. Protegido por ADMIN_SECRET.
+app.post('/reschedule', async (req, res) => {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+  if (token !== process.env.ADMIN_SECRET) return res.status(401).json({ error: 'unauthorized' });
+
+  const { phone, meeting_at } = req.body || {};
+  if (!phone || !meeting_at) return res.status(400).json({ error: 'phone y meeting_at requeridos' });
+
+  const normalized = normalizePhone(phone);
+  const when = new Date(meeting_at);
+  if (!normalized || isNaN(when.getTime())) return res.status(400).json({ error: 'datos inválidos' });
+
+  const lead = await getLead(normalized);
+  if (!lead) return res.status(404).json({ error: 'lead no encontrado' });
+
+  let meetLink = lead.meet_link || null;
+  if (lead.event_id) {
+    try {
+      const r = await updateMeeting(lead.event_id, when.toISOString());
+      meetLink = r.meetLink || meetLink;
+    } catch (err) {
+      console.error('[reschedule] calendar error:', err.message);
+      return res.status(502).json({ error: `calendar: ${err.message}` });
+    }
+  }
+  // actualiza fecha + resetea recordatorio (setEstado lo hace al pasar meeting_at)
+  await setEstado(normalized, 'agendado', when.toISOString(), meetLink).catch(err => {
+    console.error('[reschedule] setEstado error:', err.message);
+  });
+
+  res.json({ success: true, movedCalendar: !!lead.event_id });
 });
 
 // ── webhook YCloud ──────────────────────────────────────────
@@ -80,36 +146,22 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
     const event = req.body;
+    console.log('[webhook] recibido:', JSON.stringify({ type: event?.type, keys: Object.keys(event || {}) }));
 
-    // log temporal — para diagnosticar entrega de YCloud
-    console.log('[webhook] recibido:', JSON.stringify({
-      type: event?.type,
-      keys: Object.keys(event || {}),
-    }));
-
-    // mensaje entrante de WhatsApp
     if (event?.type === 'whatsapp.inbound_message.received') {
       await handleMessage(event);
       return;
     }
 
-    // cambio de atributos de contacto (tag agregado/quitado en YCloud)
     if (event?.type === 'contact.updated' || event?.type === 'contact.attributes_changed') {
-      // estructura legacy: contacto completo embebido
       let contact = event.contact;
 
-      // estructura real de YCloud v2: solo trae id + changedAttributes
       if (!contact && event.contactAttributesChanged?.id) {
         const changed = event.contactAttributesChanged.changedAttributes || {};
         const changedKeys = Object.keys(changed);
-
-        // log diagnostico: que atributos cambiaron exactamente
         console.log(`[contact.attrs] cambiaron: ${changedKeys.join(', ') || '(ninguno)'}`);
-
-        // skip si solo cambio last_seen (fires en cada lectura, no necesita sync)
         const onlyLastSeen = changedKeys.length === 1 && changedKeys[0] === 'last_seen';
         if (onlyLastSeen) return;
-
         contact = await getContactById(event.contactAttributesChanged.id);
       }
 
@@ -122,8 +174,7 @@ app.post('/webhook', async (req, res) => {
       const tags   = contact.tags || [];
       const active = tags.includes('derivado-humano');
 
-      // sincronizar BD con el estado del tag en YCloud
-      setTakeover(phone, active);
+      await setTakeover(phone, active);
       console.log(`[takeover] sync YCloud → BD: ${phone} → ${active ? 'ON' : 'OFF'} (tags: [${tags.join(', ')}])`);
     }
   } catch (err) {
@@ -132,14 +183,13 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ── takeover manual (endpoint privado para el equipo) ───────
-// POST /admin/takeover { phone, active: true/false, secret }
 app.post('/admin/takeover', async (req, res) => {
   const { phone, active, secret } = req.body;
   if (secret !== process.env.ADMIN_SECRET) return res.status(401).json({ error: 'unauthorized' });
   if (!phone) return res.status(400).json({ error: 'phone requerido' });
 
   const normalized = phone.startsWith('+') ? phone : `+${phone}`;
-  setTakeover(normalized, active);
+  await setTakeover(normalized, active);
   await setHumanTag(normalized, active).catch(() => {});
 
   res.json({ success: true, phone: normalized, active });
@@ -149,4 +199,6 @@ app.post('/admin/takeover', async (req, res) => {
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`whatsapp-bot corriendo en :${PORT}`));
+initDb()
+  .catch(err => console.error('[initDb]', err.message))
+  .finally(() => app.listen(PORT, () => console.log(`whatsapp-bot (Aurun) corriendo en :${PORT}`)));
