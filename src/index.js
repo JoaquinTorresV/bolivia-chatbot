@@ -1,8 +1,8 @@
 import express from 'express';
 import { handleMessage } from './bot.js';
 import { initDb, saveLead, setTakeover, markContactadoIfNuevo, normalizePhone, getLead, setEstado } from './db.js';
-import { setHumanTag, getContactById } from './crm.js';
-import { sendTemplate } from './ycloud.js';
+import { setHumanTag } from './crm.js';
+import { sendTemplate } from './zernio.js';
 import { updateMeeting } from './calendar.js';
 
 const app = express();
@@ -45,7 +45,7 @@ app.post('/register', async (req, res) => {
 
   // primer mensaje saliente = plantilla aprobada (si está configurada).
   // markContactadoIfNuevo es atómico: solo un request "gana" y envía → evita doble plantilla por doble submit.
-  const tpl = process.env.YCLOUD_TEMPLATE_NAME;
+  const tpl = process.env.ZERNIO_TEMPLATE_NAME;
   if (tpl && await markContactadoIfNuevo(phone)) {
     try {
       const firstName = (name || '').trim().split(/\s+/)[0] || '';
@@ -55,7 +55,7 @@ app.post('/register', async (req, res) => {
     }
   }
 
-  const waNumber = process.env.YCLOUD_PHONE_NUMBER?.replace('+', '');
+  const waNumber = process.env.ZERNIO_PHONE_NUMBER?.replace('+', '');
   const preText  = encodeURIComponent('Hola, acabo de completar el formulario.');
   res.json({ success: true, waLink: waNumber ? `https://wa.me/${waNumber}?text=${preText}` : null });
 });
@@ -87,9 +87,9 @@ app.post('/voice-lead', async (req, res) => {
   }
 
   // primer mensaje saliente tras la llamada de voz = plantilla para agendar la reunión.
-  // Usa YCLOUD_TEMPLATE_VOICE si existe (plantilla específica de voz), si no cae a la de la landing.
+  // Usa ZERNIO_TEMPLATE_VOICE si existe (plantilla específica de voz), si no cae a la de la landing.
   // markContactadoIfNuevo es atómico: solo envía si el lead está 'nuevo' → evita doble plantilla.
-  const tpl = process.env.YCLOUD_TEMPLATE_VOICE || process.env.YCLOUD_TEMPLATE_NAME;
+  const tpl = process.env.ZERNIO_TEMPLATE_VOICE || process.env.ZERNIO_TEMPLATE_NAME;
   let messaged = false;
   if (tpl && await markContactadoIfNuevo(normalized)) {
     try {
@@ -139,43 +139,18 @@ app.post('/reschedule', async (req, res) => {
   res.json({ success: true, movedCalendar: !!lead.event_id });
 });
 
-// ── webhook YCloud ──────────────────────────────────────────
+// ── webhook Zernio ──────────────────────────────────────────
 app.get('/webhook', (_req, res) => res.sendStatus(200));
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
     const event = req.body;
-    console.log('[webhook] recibido:', JSON.stringify({ type: event?.type, keys: Object.keys(event || {}) }));
+    console.log('[webhook] recibido:', JSON.stringify({ event: event?.event, platform: event?.message?.platform }));
 
-    if (event?.type === 'whatsapp.inbound_message.received') {
-      await handleMessage(event);
-      return;
-    }
-
-    if (event?.type === 'contact.updated' || event?.type === 'contact.attributes_changed') {
-      let contact = event.contact;
-
-      if (!contact && event.contactAttributesChanged?.id) {
-        const changed = event.contactAttributesChanged.changedAttributes || {};
-        const changedKeys = Object.keys(changed);
-        console.log(`[contact.attrs] cambiaron: ${changedKeys.join(', ') || '(ninguno)'}`);
-        const onlyLastSeen = changedKeys.length === 1 && changedKeys[0] === 'last_seen';
-        if (onlyLastSeen) return;
-        contact = await getContactById(event.contactAttributesChanged.id);
-      }
-
-      if (!contact?.phoneNumber) {
-        console.log('[takeover] no se pudo obtener phoneNumber del contacto');
-        return;
-      }
-
-      const phone  = contact.phoneNumber;
-      const tags   = contact.tags || [];
-      const active = tags.includes('derivado-humano');
-
-      await setTakeover(phone, active);
-      console.log(`[takeover] sync YCloud → BD: ${phone} → ${active ? 'ON' : 'OFF'} (tags: [${tags.join(', ')}])`);
+    // Zernio entrega los mensajes entrantes como `message.received`.
+    if (event?.event === 'message.received' && event?.message?.platform === 'whatsapp') {
+      await handleMessage(event.message);
     }
   } catch (err) {
     console.error('webhook error:', err.message);

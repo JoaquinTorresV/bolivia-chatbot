@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { getHistory, saveHistory, clearHistory, getLead, saveLead, saveLeadEmail, isTakeover, setTakeover, setEstado } from './db.js';
 import { getAvailableSlots, createMeeting, updateMeeting, cancelMeeting, checkSlot, nearbyFreeSlots, nowInBolivia } from './calendar.js';
-import { sendWhatsApp, markReadWithTyping } from './ycloud.js';
+import { sendMessage, markReadWithTyping } from './zernio.js';
 import { upsertContact, setHumanTag } from './crm.js';
 import { transcribeAudio } from './media.js';
 import { readFileSync } from 'fs';
@@ -175,30 +175,37 @@ async function callClaude(systemPrompt, messages) {
   });
 }
 
-export async function handleMessage(event) {
-  const msg = event.whatsappInboundMessage;
-  if (!msg) return;
+// Zernio entrega el teléfono sin '+'; lo pasamos a formato internacional.
+function phoneFromSender(raw) {
+  if (!raw) return null;
+  const d = String(raw).replace(/\D/g, '');
+  return d ? `+${d}` : null;
+}
 
-  const phone = msg.from;
-  const wamid = msg.wamid || msg.id;
+// `msg` es el objeto `message` del webhook `message.received` de Zernio.
+export async function handleMessage(msg) {
+  if (!msg || msg.direction === 'outgoing') return;   // ignora el eco de lo que enviamos
+
+  const phone          = phoneFromSender(msg.sender?.id);
+  const conversationId = msg.conversationId;
+  if (!phone || !conversationId) return;
 
   // takeover activo → bot no interviene
   if (await isTakeover(phone)) return;
 
-  // fire-and-forget: marcar como leido + typing indicator inmediato (no bloquea)
-  markReadWithTyping(wamid);
+  // fire-and-forget: typing (en WhatsApp también marca como leído) — por conversación
+  markReadWithTyping(conversationId);
 
   // try/catch global: cualquier error inesperado → fallback al usuario en vez de dejarlo en el visto
   try {
-    // extraer contenido segun tipo de mensaje
-    const userContent = await extractContent(msg, phone);
+    const userContent = await extractContent(msg, conversationId);
     if (!userContent) return;
 
     const lead = await getLead(phone);
-    const displayName = lead?.name || msg.customerProfile?.name || null;
+    const displayName = lead?.name || msg.sender?.name || null;
 
     // Lead directo (escribió sin venir de landing/voz): regístralo YA como 'incompleto' para no
-    // perderlo, con el nombre del perfil de WhatsApp. Pasa a 'respondió' cuando dé rubro+problema.
+    // perderlo. Pasa a 'respondió' cuando dé rubro+problema.
     if (!lead) {
       await saveLead({ phone, name: displayName, source: 'organic', estado: 'incompleto' }).catch(() => {});
     }
@@ -208,13 +215,13 @@ export async function handleMessage(event) {
       await setEstado(phone, 'respondio').catch(() => {});
     }
 
-    // fire-and-forget: sync contacto a YCloud CRM en paralelo (no bloquea)
+    // fire-and-forget: sync contacto al CRM en paralelo (no bloquea; no-op si no hay CRM)
     if (displayName) upsertContact(phone, displayName).catch(() => {});
 
     // comando reset (testing)
     if (typeof userContent === 'string' && userContent.toLowerCase() === '/reset') {
       await clearHistory(phone);
-      await sendWhatsApp(phone, 'Conversación reiniciada.');
+      await sendMessage(conversationId, 'Conversación reiniciada.');
       return;
     }
 
@@ -226,60 +233,46 @@ export async function handleMessage(event) {
       response = await callClaude(buildSystemPrompt(lead), history);
     } catch (err) {
       console.error('[claude] error:', err.message);
-      await sendWhatsApp(phone, 'Tuve un problema procesando tu mensaje. ¿Puedes repetirlo?');
+      await sendMessage(conversationId, 'Tuve un problema procesando tu mensaje. ¿Puedes repetirlo?');
       return;
     }
 
-    await processResponse(phone, lead, displayName, history, response);
+    await processResponse(phone, conversationId, lead, displayName, history, response);
   } catch (err) {
     console.error('[handleMessage] error inesperado:', err.message, err.stack);
-    // ultimo recurso: avisar al usuario que algo se rompio
     try {
-      await sendWhatsApp(phone, 'Tuve un problema técnico procesando tu mensaje. ¿Puedes intentar de nuevo?');
+      await sendMessage(conversationId, 'Tuve un problema técnico procesando tu mensaje. ¿Puedes intentar de nuevo?');
     } catch { /* si ni esto funciona, ya fue */ }
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// extraccion de contenido por tipo de mensaje
+// extraccion de contenido del mensaje de Zernio (texto / adjuntos)
 // ─────────────────────────────────────────────────────────────
 
-async function extractContent(msg, phone) {
-  switch (msg.type) {
-    case 'text':
-      return msg.text?.body?.trim() || null;
+async function extractContent(msg, conversationId) {
+  // texto plano (incluye el caption si vino con un adjunto)
+  if (msg.text && msg.text.trim()) return msg.text.trim();
 
+  const att = (msg.attachments || [])[0];
+  if (!att) return null;
+
+  switch (att.type) {
     case 'audio': {
-      const link = msg.audio?.link;
-      if (!link) {
-        console.warn('[audio] mensaje sin link de audio');
-        await sendWhatsApp(phone, 'No pude descargar el audio. ¿Puedes escribirlo?');
-        return null;
-      }
-      const transcript = await transcribeAudio(link);
+      // la URL del audio es un endpoint autenticado de Zernio; transcribeAudio baja con Bearer
+      const transcript = await transcribeAudio(att.url);
       if (!transcript) {
-        await sendWhatsApp(phone, 'No pude entender el audio (puede ser muy largo). ¿Puedes resumirlo por texto?');
+        await sendMessage(conversationId, 'No pude entender el audio (puede ser muy largo). ¿Puedes resumirlo por texto?');
         return null;
       }
       return `[Audio transcrito]: ${transcript}`;
     }
-
     case 'image':
-      return msg.image?.caption?.trim() || '[El usuario envió una imagen sin texto]';
-
+      return '[El usuario envió una imagen sin texto]';
     case 'video':
-      return msg.video?.caption?.trim() || '[El usuario envió un video sin texto]';
-
-    case 'document':
-      return `[El usuario envió un documento: ${msg.document?.filename || 'archivo'}]`;
-
-    case 'location':
-      return `[El usuario compartió su ubicación: lat ${msg.location?.latitude}, lng ${msg.location?.longitude}]`;
-
-    case 'sticker':
-    case 'reaction':
-      return null;
-
+      return '[El usuario envió un video sin texto]';
+    case 'file':
+      return '[El usuario envió un documento]';
     default:
       return null;
   }
@@ -289,11 +282,11 @@ async function extractContent(msg, phone) {
 // procesamiento de la respuesta de Claude (tool calls + texto)
 // ─────────────────────────────────────────────────────────────
 
-async function processResponse(phone, lead, displayName, history, response, depth = 0) {
+async function processResponse(phone, conversationId, lead, displayName, history, response, depth = 0) {
   const toolUses = response.content.filter(b => b.type === 'tool_use');
 
   // sin tools → respuesta de texto normal
-  if (!toolUses.length) return sendText(phone, history, response);
+  if (!toolUses.length) return sendText(phone, conversationId, history, response);
 
   // transfer_to_human corta la conversacion, no necesita follow-up
   const transfer = toolUses.find(b => b.name === 'transfer_to_human');
@@ -304,7 +297,7 @@ async function processResponse(phone, lead, displayName, history, response, dept
     const farewell = 'Un momento, te conecto con nuestro equipo ahora mismo. En breve te responden 👋';
     history.push({ role: 'assistant', content: farewell });
     await saveHistory(phone, history);
-    await sendWhatsApp(phone, farewell);
+    await sendMessage(conversationId, farewell);
     return;
   }
 
@@ -473,21 +466,21 @@ async function processResponse(phone, lead, displayName, history, response, dept
   if (confirmMsg) {
     history.push({ role: 'assistant', content: confirmMsg });
     await saveHistory(phone, history);
-    await sendWhatsApp(phone, confirmMsg);
+    await sendMessage(conversationId, confirmMsg);
     return;
   }
 
   // solo guardados silenciosos y el modelo ya escribio texto → responder tal cual
   const soloSilenciosos = toolUses.every(b => b.name === 'save_lead_context');
   const texto = response.content.find(b => b.type === 'text')?.text;
-  if (soloSilenciosos && texto) return sendText(phone, history, response);
+  if (soloSilenciosos && texto) return sendText(phone, conversationId, history, response);
 
   // resto → devolver los tool_results y dejar que el modelo redacte
-  return continueWithToolResults(phone, lead, displayName, history, response.content, results, depth);
+  return continueWithToolResults(phone, conversationId, lead, displayName, history, response.content, results, depth);
 }
 
 // envia el bloque de texto de una respuesta y lo guarda en el historial
-async function sendText(phone, history, response) {
+async function sendText(phone, conversationId, history, response) {
   const reply = response.content.find(b => b.type === 'text')?.text;
   if (!reply) {
     console.warn(`[bot] turno sin texto (stop_reason: ${response.stop_reason}) — nada que enviar`);
@@ -495,16 +488,16 @@ async function sendText(phone, history, response) {
   }
   history.push({ role: 'assistant', content: reply });
   await saveHistory(phone, history);
-  await sendWhatsApp(phone, reply);
+  await sendMessage(conversationId, reply);
 }
 
 const MAX_TOOL_DEPTH = 3;
 
 // continua la conversacion devolviendo todos los tool_results del turno
-async function continueWithToolResults(phone, lead, displayName, history, prevContent, results, depth) {
+async function continueWithToolResults(phone, conversationId, lead, displayName, history, prevContent, results, depth) {
   if (depth >= MAX_TOOL_DEPTH) {
     console.warn(`[bot] profundidad de tools agotada (${depth}) para ${phone}`);
-    await sendWhatsApp(phone, 'Se me complico procesar eso. ¿Lo intentamos de nuevo?');
+    await sendMessage(conversationId, 'Se me complico procesar eso. ¿Lo intentamos de nuevo?');
     return;
   }
 
@@ -516,9 +509,9 @@ async function continueWithToolResults(phone, lead, displayName, history, prevCo
     followUp = await callClaude(buildSystemPrompt(lead), history);
   } catch (err) {
     console.error('[claude] follow-up error:', err.message);
-    await sendWhatsApp(phone, 'Tuve un problema procesando los horarios. ¿Puedes intentar de nuevo?');
+    await sendMessage(conversationId, 'Tuve un problema procesando los horarios. ¿Puedes intentar de nuevo?');
     return;
   }
 
-  return processResponse(phone, lead, displayName, history, followUp, depth + 1);
+  return processResponse(phone, conversationId, lead, displayName, history, followUp, depth + 1);
 }

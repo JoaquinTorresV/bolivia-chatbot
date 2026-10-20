@@ -9,7 +9,7 @@ const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 60_000 }) // 60s max
   : null;
 
-const FETCH_TIMEOUT_MS = 30_000; // 30s para bajar el audio de YCloud
+const FETCH_TIMEOUT_MS = 30_000; // 30s para bajar el audio de Zernio
 const MAX_AUDIO_BYTES  = 24 * 1024 * 1024; // 24MB (Whisper acepta hasta 25MB)
 
 export async function transcribeAudio(audioUrl) {
@@ -27,7 +27,7 @@ export async function transcribeAudio(audioUrl) {
     let res;
     try {
       res = await fetch(audioUrl, {
-        headers: { 'X-API-Key': process.env.YCLOUD_API_KEY },
+        headers: { 'Authorization': `Bearer ${process.env.ZERNIO_API_KEY}` },
         signal:  controller.signal,
       });
     } finally {
