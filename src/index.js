@@ -30,11 +30,16 @@ app.post('/register', async (req, res) => {
   const phone = normalizePhone(rawPhone);
   if (!phone) return res.status(400).json({ error: 'teléfono inválido' });
 
-  const name    = b.nombre  ?? b.name    ?? null;
-  const company = b.negocio ?? b.company ?? null;
-  const niche   = b.rubro   ?? b.niche   ?? null;
-  const problem = b.desafio ?? b.problem ?? null;
-  const email   = b.email   ?? null;
+  const name    = (b.nombre  ?? b.name    ?? '').trim();
+  const company = (b.negocio ?? b.company ?? '').trim();
+  const niche   = (b.rubro   ?? b.niche   ?? '').trim();
+  const problem = (b.desafio ?? b.problem ?? '').trim();
+  const email   = b.email ?? null;
+
+  // Campos obligatorios: rechaza envíos vacíos (POST directos / bots con solo el teléfono).
+  if (!name || !company || !niche || !problem) {
+    return res.status(400).json({ error: 'faltan datos obligatorios (nombre, negocio, rubro, desafío)' });
+  }
 
   try {
     await saveLead({ phone, name, company, niche, problem, email, source: 'web', estado: 'nuevo', fbp: b.fbp, fbc: b.fbc });
