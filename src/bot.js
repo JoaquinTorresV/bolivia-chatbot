@@ -11,7 +11,7 @@ import { dirname, join } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_PROMPT = readFileSync(join(__dirname, '../prompts/system.md'), 'utf-8');
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = new Anthropic({ apiKey: (process.env.ANTHROPIC_API_KEY || '').trim() });
 const MODEL = 'claude-haiku-4-5';
 
 const TOOLS = [

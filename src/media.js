@@ -5,8 +5,9 @@ import OpenAI from 'openai';
 
 // Whisper de OpenAI — ~$0.006 por minuto
 // Si no hay API key configurada, la transcripcion devuelve null (audio queda ignorado)
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 60_000 }) // 60s max
+const OPENAI_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const openai = OPENAI_KEY
+  ? new OpenAI({ apiKey: OPENAI_KEY, timeout: 60_000 }) // 60s max
   : null;
 
 const FETCH_TIMEOUT_MS = 30_000; // 30s para bajar el audio de Zernio
