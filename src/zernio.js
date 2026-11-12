@@ -1,10 +1,12 @@
 // Capa de mensajería WhatsApp vía Zernio (bot de Bolivia).
 // Zernio trabaja por CONVERSACIONES, no por número: la plantilla abre/retoma la conversación
 // (participantId = teléfono); el texto libre se envía a un conversationId (viene en el webhook).
-const API_KEY    = process.env.ZERNIO_API_KEY;
-const ACCOUNT_ID = process.env.ZERNIO_ACCOUNT_ID;   // id de la cuenta de WhatsApp en Zernio
+// .trim() defensivo: un espacio o salto de línea invisible al pegar la env rompía el envío
+// (Zernio devuelve "Invalid accountId format").
+const API_KEY    = (process.env.ZERNIO_API_KEY || '').trim();
+const ACCOUNT_ID = (process.env.ZERNIO_ACCOUNT_ID || '').trim();   // id de la cuenta de WhatsApp en Zernio
 const BASE       = 'https://zernio.com/api/v1';
-const TEMPLATE_LANG = process.env.ZERNIO_TEMPLATE_LANG || 'es';
+const TEMPLATE_LANG = (process.env.ZERNIO_TEMPLATE_LANG || 'es').trim();
 
 export const zernioReady = !!(API_KEY && ACCOUNT_ID);
 
